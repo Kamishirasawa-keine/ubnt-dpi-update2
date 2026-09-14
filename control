@@ -1,11 +1,13 @@
 Package: ubnt-dpi-update2
-Version: 1.0.0-1
-Architecture: all
+Version: 1.1.0-1
+Architecture: mipsel
 Maintainer: Kamishirasawa-keine <kurisu3a0f@outlook.com>
 Section: net
 Description: Update EdgeOS DPI signatures from the ASUS LiveUpdate servers
  The original dl.ubnt.com DPI signature source is dead (404); ASUS
  publishes the same Trend Micro TDTS signatures (rule.trf). Provides
  /usr/sbin/ubnt-update-dpi2, an hourly cron job honoring the
- signature-update configuration, and the "update dpi2 signatures"
- op-mode command.
+ signature-update configuration, the "update dpi2 signatures" op-mode
+ command, and /usr/sbin/tdts-dpi-dump which can regenerate rule.xml and
+ cats.xml from the loaded signatures (opt-in per update via "set system
+ traffic-analysis signature-update regen-xml").

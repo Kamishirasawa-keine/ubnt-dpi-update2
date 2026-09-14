@@ -19,6 +19,12 @@
 #     which EdgeOS cannot check (no rsasign_sig_check), so we validate
 #     the TDTS magic instead and roll back if tdts_rule_agent
 #     rejects the file
+#
+# After the new signature is loaded, the application-name XML files can be
+# regenerated from the engine via tdts-dpi-dump. This is gated by the
+# "system traffic-analysis signature-update regen-xml" config node (off by
+# default); the U2_REGEN_XML environment variable overrides it for testing
+# (1 = force on, 0 = force off).
 
 VER_URL="https://dlcdnets.asus.com/pub/ASUS/LiveUpdate/Release/Wireless/sig2nd_update.zip"
 SIG_BASE="https://dlcdnets.asus.com/pub/ASUS/wireless/ASUSWRT"
@@ -27,9 +33,11 @@ SKU="WW"
 
 DATA_DIR=/etc/ubnt/tdts
 SIG_XML_FILE=rule.xml
+CATS_XML_FILE=cats.xml
 SIG_TRF_FILE=rule.trf
 STATE_FILE=${DATA_DIR}/asus-sig.ver
 BACKUP_FILE=${DATA_DIR}/rule.trf.old
+XML_BACKUP_DIR=${DATA_DIR}
 
 DPI_ENABLE_ADK=/proc/cavium/ipv4/dpi
 DPI_ENABLE_NF=/proc/nf_dpi/dpi
@@ -82,17 +90,60 @@ check_trf() {
    [ "$(od -An -tx1 -N4 "$1" | tr -d ' \n')" = "$TRF_MAGIC" ] || return 1
 }
 
+regen_enabled() {
+   case "${U2_REGEN_XML:-}" in
+      1|yes|true|Yes|TRUE|True) return 0 ;;
+      0|no|false|No|FALSE|False) return 1 ;;
+   esac
+   if command -v cli-shell-api >/dev/null 2>&1; then
+      cli-shell-api existsActive "system traffic-analysis signature-update" regen-xml >/dev/null 2>&1 && return 0
+   fi
+   return 1
+}
+
+regen_xml() {
+   xml_replaced=0
+   regen_enabled || return 0
+   if [ ! -x /usr/sbin/tdts-dpi-dump ]; then
+      echo "Warning: regen-xml enabled but /usr/sbin/tdts-dpi-dump is missing" >&2
+      logger -t DPI2 -s "Warning: regen-xml enabled but tdts-dpi-dump is missing"
+      return 0
+   fi
+   echo "Regenerating rule.xml/cats.xml from the loaded signature"
+   if ! /usr/sbin/tdts-dpi-dump xml "$WORK_DIR"; then
+      echo "Warning: tdts-dpi-dump failed, keeping old XML" >&2
+      logger -t DPI2 -s "Warning: tdts-dpi-dump failed, keeping old XML"
+      return 0
+   fi
+   if [ "$(grep -c '<application ' "$WORK_DIR/$SIG_XML_FILE" 2>/dev/null)" -lt 100 ] ||
+      [ "$(grep -c '<app_category ' "$WORK_DIR/$CATS_XML_FILE" 2>/dev/null)" -lt 5 ]; then
+      echo "Warning: generated XML failed sanity check, keeping old XML" >&2
+      logger -t DPI2 -s "Warning: generated XML failed sanity check, keeping old XML"
+      return 0
+   fi
+   [ -f "$XML_BACKUP_DIR/$SIG_XML_FILE" ] && cp "$XML_BACKUP_DIR/$SIG_XML_FILE" "$XML_BACKUP_DIR/$SIG_XML_FILE.old"
+   [ -f "$XML_BACKUP_DIR/$CATS_XML_FILE" ] && cp "$XML_BACKUP_DIR/$CATS_XML_FILE" "$XML_BACKUP_DIR/$CATS_XML_FILE.old"
+   mv "$WORK_DIR/$SIG_XML_FILE" "$DATA_DIR/$SIG_XML_FILE"
+   mv "$WORK_DIR/$CATS_XML_FILE" "$DATA_DIR/$CATS_XML_FILE"
+   xml_replaced=1
+}
+
 rollback() {
    logger -t DPI2 -s "Error: DPI signature update failed, rolling back"
+   if [ -f "$BACKUP_FILE" ]; then
+      cp "$BACKUP_FILE" "$DATA_DIR/$SIG_TRF_FILE"
+   fi
+   if [ "$xml_replaced" = 1 ]; then
+      [ -f "$XML_BACKUP_DIR/$SIG_XML_FILE.old" ] && cp "$XML_BACKUP_DIR/$SIG_XML_FILE.old" "$DATA_DIR/$SIG_XML_FILE"
+      [ -f "$XML_BACKUP_DIR/$CATS_XML_FILE.old" ] && cp "$XML_BACKUP_DIR/$CATS_XML_FILE.old" "$DATA_DIR/$CATS_XML_FILE"
+   fi
+   /usr/sbin/tdts_rule_agent -r "$DATA_DIR/$SIG_TRF_FILE" >/dev/null 2>&1
+   /usr/sbin/ubnt-hal dpiLoadApps "$DATA_DIR/$SIG_XML_FILE"
    if [ "$hasAdk" = 1 ] && [ "$old_val_adk" = 1 ]; then
       echo 1 > $DPI_ENABLE_ADK
    fi
    if [ "$old_val_nf" = 1 ]; then
       echo 1 > $DPI_ENABLE_NF
-   fi
-   if [ -f "$BACKUP_FILE" ]; then
-      cp "$BACKUP_FILE" "$DATA_DIR/$SIG_TRF_FILE"
-      /usr/sbin/tdts_rule_agent -r "$DATA_DIR/$SIG_TRF_FILE" >/dev/null 2>&1
    fi
    echo "Signature update failed, rolled back to previous signatures" >&2
    exit 1
@@ -120,6 +171,7 @@ cmd_update() {
 
    WORK_DIR=$(mktemp -d) || exit 1
    trap 'rm -rf "$WORK_DIR"' EXIT
+   xml_replaced=0
 
    rver=$(remote_version) || exit 1
    cver=$(local_version)
@@ -167,18 +219,20 @@ cmd_update() {
       fi
    fi
 
-   echo "Loading new application names"
-   /usr/sbin/ubnt-hal dpiLoadApps "$DATA_DIR/$SIG_XML_FILE"
-   if [ "$?" != 0 ]; then
-      rollback
-   fi
-
    echo "Loading new signatures"
    tdts_out=$(/usr/sbin/tdts_rule_agent -r "$DATA_DIR/$SIG_TRF_FILE" 2>&1)
    if [ "$?" != 0 ]; then
       rollback
    fi
    [ -n "$tdts_out" ] && echo "$tdts_out"
+
+   regen_xml
+
+   echo "Loading new application names"
+   /usr/sbin/ubnt-hal dpiLoadApps "$DATA_DIR/$SIG_XML_FILE"
+   if [ "$?" != 0 ]; then
+      rollback
+   fi
 
    if [ "$old_val_adk" = 1 ]; then
       echo "Enabling DPI Engine offload"

@@ -1,11 +1,18 @@
 .PHONY: all clean
 
+CROSS ?= mipsel-linux-musl
+
 all: package.deb
 
 clean:
-	rm -f data.tar.gz control.tar.gz debian-binary package.deb
+	rm -f data.tar.gz control.tar.gz debian-binary package.deb usr/sbin/tdts-dpi-dump
 
-data.tar.gz: etc opt usr
+usr/sbin/tdts-dpi-dump: tdts-dpi-dump.c tdts_shell_ioctl.h
+	mkdir -p usr/sbin
+	$(CROSS)-gcc -Os -Wall -march=mips32r2 -static -o $@ tdts-dpi-dump.c
+	$(CROSS)-strip $@
+
+data.tar.gz: etc opt usr/sbin/tdts-dpi-dump
 	tar --owner=root:0 --group root:0 -czf $@ etc opt usr
 
 control.tar.gz: control

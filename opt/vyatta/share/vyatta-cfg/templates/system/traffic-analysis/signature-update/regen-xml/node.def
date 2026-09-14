@@ -1,0 +1,7 @@
+help: Regenerate rule.xml and cats.xml from the loaded signatures after each update (tdts-dpi-dump)
+
+syntax:expression: exec "
+       if [ -n \"$VAR(../disable)\" ]; then
+          echo Warning signature update is disabled, regen-xml will have no effect
+          exit 0
+       fi"
