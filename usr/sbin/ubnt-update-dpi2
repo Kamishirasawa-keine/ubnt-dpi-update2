@@ -194,7 +194,10 @@ cmd_update() {
 
    mkdir -p "$DATA_DIR"
    [ -f "$DATA_DIR/$SIG_TRF_FILE" ] && cp "$DATA_DIR/$SIG_TRF_FILE" "$BACKUP_FILE"
-   cp "$new_trf" "$DATA_DIR/$SIG_TRF_FILE"
+   cp "$new_trf" "$DATA_DIR/$SIG_TRF_FILE" || {
+      echo "Error installing signature file" >&2
+      exit 1
+   }
 
    if [ "$hasAdk" = 1 ] && [ -e $DPI_ENABLE_ADK ]; then
       old_val_adk=$(cat $DPI_ENABLE_ADK)

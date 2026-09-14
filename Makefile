@@ -12,7 +12,9 @@ usr/sbin/tdts-dpi-dump: src/tdts-dpi-dump.c src/tdts_shell_ioctl.h
 	$(CROSS)-gcc -Os -Wall -march=mips32r2 -static -o $@ src/tdts-dpi-dump.c
 	$(CROSS)-strip $@
 
-data.tar.gz: etc opt usr/sbin/tdts-dpi-dump
+DATA_SRCS := $(shell find etc opt usr -type f 2>/dev/null)
+
+data.tar.gz: $(DATA_SRCS) usr/sbin/tdts-dpi-dump
 	tar --owner=root:0 --group root:0 -czf $@ etc opt usr
 
 control.tar.gz: control
