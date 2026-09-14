@@ -1,0 +1,2 @@
+help: Update DPI signatures from ASUS LiveUpdate
+run: sudo /usr/sbin/ubnt-update-dpi2

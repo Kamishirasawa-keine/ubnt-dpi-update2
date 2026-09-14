@@ -1,0 +1,208 @@
+#!/bin/bash
+#
+# ubnt-update-dpi2 -- update EdgeOS DPI signatures from the ASUS LiveUpdate
+# servers, replacing ubnt-update-dpi whose source
+# https://dl.ubnt.com/firmwares/edgemax/dpi/0001/ is dead (404).
+#
+# ASUSWRT ships the same Trend Micro TDTS signature format (rule.trf,
+# magic 23 07 06 12). Its pull logic (asuswrt sig2nd_update.sh /
+# sig2nd_upgrade.sh) has a few quirks:
+#   - "sig2nd_update.zip" is not a zip but plain text: "WW_FULL#2.516"
+#     (PART is deprecated, WRS is a small URL-reputation db, HNS is a
+#     different engine; FULL is the traffic-classification db we want)
+#   - the signature file name embeds SKU+type and the dot-stripped
+#     version: WW_FULL_2516_un.zip -- and despite the .zip suffix it
+#     is a RAW rule.trf
+#   - dlcdnets.asus.com geo-redirects (301, e.g. .com -> .com.cn),
+#     redirects must be followed
+#   - there is no md5sum; ASUS verifies via an _rsa<N>.zip sidecar
+#     which EdgeOS cannot check (no rsasign_sig_check), so we validate
+#     the TDTS magic instead and roll back if tdts_rule_agent
+#     rejects the file
+
+VER_URL="https://dlcdnets.asus.com/pub/ASUS/LiveUpdate/Release/Wireless/sig2nd_update.zip"
+SIG_BASE="https://dlcdnets.asus.com/pub/ASUS/wireless/ASUSWRT"
+SIG_TYPE="${U2_SIG_TYPE:-FULL}"
+SKU="WW"
+
+DATA_DIR=/etc/ubnt/tdts
+SIG_XML_FILE=rule.xml
+SIG_TRF_FILE=rule.trf
+STATE_FILE=${DATA_DIR}/asus-sig.ver
+BACKUP_FILE=${DATA_DIR}/rule.trf.old
+
+DPI_ENABLE_ADK=/proc/cavium/ipv4/dpi
+DPI_ENABLE_NF=/proc/nf_dpi/dpi
+
+TRF_MAGIC="23070612"
+MIN_TRF_SIZE=100000
+
+fetch() {
+   timeout=$1
+   url=$2
+   shift 2
+   curl -fsSL --retry 2 --max-time "$timeout" "$@" "$url"
+}
+
+remote_version() {
+   out=$(fetch 30 "$VER_URL") || {
+      echo "Error downloading signature version file" >&2
+      return 1
+   }
+   ver=$(printf '%s\n' "$out" | tr -d '\r' | sed -n "s/^${SKU}_${SIG_TYPE}#//p" | head -n1)
+   if [ -z "$ver" ]; then
+      echo "No ${SKU}_${SIG_TYPE} entry in signature version file" >&2
+      return 1
+   fi
+   echo "$ver"
+}
+
+local_version() {
+   [ -f "$STATE_FILE" ] || return 1
+   sed -n "s/^${SKU}_${SIG_TYPE}#//p" "$STATE_FILE" | head -n1
+}
+
+sig_newer() {
+   [ -z "$2" ] && return 0
+   rmj=${1%%.*}
+   rmn=${1#*.}
+   lmj=${2%%.*}
+   lmn=${2#*.}
+   [ "$rmj" = "$1" ] && rmn=0
+   [ "$lmj" = "$2" ] && lmn=0
+   if [ "$rmj" -gt "$lmj" ] || { [ "$rmj" -eq "$lmj" ] && [ "$rmn" -gt "$lmn" ]; }; then
+      return 0
+   fi
+   return 1
+}
+
+check_trf() {
+   [ -s "$1" ] || return 1
+   [ "$(wc -c < "$1")" -ge "$MIN_TRF_SIZE" ] || return 1
+   [ "$(od -An -tx1 -N4 "$1" | tr -d ' \n')" = "$TRF_MAGIC" ] || return 1
+}
+
+rollback() {
+   logger -t DPI2 -s "Error: DPI signature update failed, rolling back"
+   if [ "$hasAdk" = 1 ] && [ "$old_val_adk" = 1 ]; then
+      echo 1 > $DPI_ENABLE_ADK
+   fi
+   if [ "$old_val_nf" = 1 ]; then
+      echo 1 > $DPI_ENABLE_NF
+   fi
+   if [ -f "$BACKUP_FILE" ]; then
+      cp "$BACKUP_FILE" "$DATA_DIR/$SIG_TRF_FILE"
+      /usr/sbin/tdts_rule_agent -r "$DATA_DIR/$SIG_TRF_FILE" >/dev/null 2>&1
+   fi
+   echo "Signature update failed, rolled back to previous signatures" >&2
+   exit 1
+}
+
+cmd_check() {
+   rver=$(remote_version) || return 1
+   cver=$(local_version)
+   if [ -z "$cver" ]; then
+      echo "local: (none)  remote: ${SKU}_${SIG_TYPE}#${rver} -- update available"
+   elif sig_newer "$rver" "$cver"; then
+      echo "local: ${SKU}_${SIG_TYPE}#${cver}  remote: ${rver} -- update available"
+   else
+      echo "local: ${SKU}_${SIG_TYPE}#${cver}  remote: ${rver} -- up to date"
+   fi
+}
+
+cmd_update() {
+   hasDpi=$(/usr/sbin/ubnt-hal hasDpi 2>/dev/null)
+   if [ "$hasDpi" != 1 ]; then
+      echo "Platform does not support DPI"
+      exit 1
+   fi
+   hasAdk=$(/usr/sbin/ubnt-hal hasAdk 2>/dev/null)
+
+   WORK_DIR=$(mktemp -d) || exit 1
+   trap 'rm -rf "$WORK_DIR"' EXIT
+
+   rver=$(remote_version) || exit 1
+   cver=$(local_version)
+   if ! sig_newer "$rver" "$cver"; then
+      echo "No new signatures available (${SKU}_${SIG_TYPE}#${cver:-unknown})"
+      exit 0
+   fi
+
+   echo "Downloading new signatures (${SKU}_${SIG_TYPE}#${rver})"
+   new_trf="${WORK_DIR}/${SIG_TRF_FILE}"
+   fetch 300 "${SIG_BASE}/${SKU}_${SIG_TYPE}_${rver//./}_un.zip" -o "$new_trf" || {
+      echo "Error downloading new signature file" >&2
+      exit 1
+   }
+
+   check_trf "$new_trf" || {
+      echo "Invalid signature file" >&2
+      exit 1
+   }
+
+   mkdir -p "$DATA_DIR"
+   [ -f "$DATA_DIR/$SIG_TRF_FILE" ] && cp "$DATA_DIR/$SIG_TRF_FILE" "$BACKUP_FILE"
+   cp "$new_trf" "$DATA_DIR/$SIG_TRF_FILE"
+
+   if [ "$hasAdk" = 1 ] && [ -e $DPI_ENABLE_ADK ]; then
+      old_val_adk=$(cat $DPI_ENABLE_ADK)
+   else
+      old_val_adk=0
+   fi
+   if [ -e $DPI_ENABLE_NF ]; then
+      old_val_nf=$(cat $DPI_ENABLE_NF)
+   else
+      old_val_nf=0
+   fi
+
+   if [ "$old_val_adk" != 1 ] && [ "$old_val_nf" != 1 ]; then
+      echo "DPI currently not enabled"
+   else
+      echo "Disabling DPI engine"
+      if [ "$hasAdk" = 1 ] && [ "$old_val_adk" = 1 ]; then
+         echo 0 > $DPI_ENABLE_ADK
+      fi
+      if [ "$old_val_nf" = 1 ]; then
+         echo 0 > $DPI_ENABLE_NF
+      fi
+   fi
+
+   echo "Loading new application names"
+   /usr/sbin/ubnt-hal dpiLoadApps "$DATA_DIR/$SIG_XML_FILE"
+   if [ "$?" != 0 ]; then
+      rollback
+   fi
+
+   echo "Loading new signatures"
+   tdts_out=$(/usr/sbin/tdts_rule_agent -r "$DATA_DIR/$SIG_TRF_FILE" 2>&1)
+   if [ "$?" != 0 ]; then
+      rollback
+   fi
+   [ -n "$tdts_out" ] && echo "$tdts_out"
+
+   if [ "$old_val_adk" = 1 ]; then
+      echo "Enabling DPI Engine offload"
+      echo 1 > $DPI_ENABLE_ADK
+   fi
+   if [ "$old_val_nf" = 1 ]; then
+      echo "Enabling DPI Engine netfilter"
+      echo 1 > $DPI_ENABLE_NF
+   fi
+
+   echo "${SKU}_${SIG_TYPE}#${rver}" > "$STATE_FILE"
+   echo "New signature downloaded successfully: ${SKU}_${SIG_TYPE}#${rver}"
+   logger -t DPI2 -s "Signatures update ok (${SKU}_${SIG_TYPE}#${rver})"
+}
+
+case "${1:-update}" in
+   update)
+      cmd_update
+      ;;
+   check)
+      cmd_check
+      ;;
+   *)
+      echo "Usage: ubnt-update-dpi2 [check|update]" >&2
+      exit 2
+      ;;
+esac

@@ -1,0 +1,27 @@
+#!/bin/bash
+#
+# cron job to update DPI signatures
+
+if ! $(/usr/sbin/ubnt-hal hasDpi > /dev/null); then
+   exit 0
+fi
+
+cli_path="system traffic-analysis signature-update"
+if $(cli-shell-api existsActive $cli_path disable); then
+   exit 0
+fi
+
+cur_hour=$(date +%-H)
+update_hour=$(cli-shell-api returnActiveValue $cli_path update-hour)
+
+if [ -z "$update_hour" ]; then
+   update_hour=6
+fi
+
+if [ "$update_hour" != "$cur_hour" ]; then
+   exit 0
+fi
+
+/usr/sbin/ubnt-update-dpi2 > /dev/null
+
+exit 0
